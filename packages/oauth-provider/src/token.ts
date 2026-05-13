@@ -30,6 +30,8 @@ import {
 	validateClientCredentials,
 } from "./utils";
 
+const REFRESH_ROTATION_REPLAY_GRACE_MS = 30_000;
+
 /**
  * Handles the /oauth2/token endpoint by delegating
  * the grant types
@@ -315,6 +317,58 @@ export async function invalidateRefreshFamily(
 			{ field: "userId", value: userId },
 		],
 	});
+}
+
+/**
+ * A stale parent can be replayed by an in-flight request immediately after a
+ * successful rotation. If a fresh child exists, fail the stale request without
+ * deleting the legitimate child's family.
+ *
+ * @internal
+ */
+export async function shouldInvalidateRefreshFamilyForRevokedToken(
+	ctx: GenericEndpointContext,
+	refreshToken: OAuthRefreshToken<Scope[]> & { id: string },
+) {
+	let revokedAt = normalizeTimestampValue(refreshToken.revoked);
+	if (!revokedAt) {
+		const latest = await ctx.context.adapter.findOne<
+			OAuthRefreshToken<Scope[]> & { id: string }
+		>({
+			model: "oauthRefreshToken",
+			where: [{ field: "id", value: refreshToken.id }],
+		});
+		revokedAt = normalizeTimestampValue(latest?.revoked);
+	}
+	if (!revokedAt) {
+		return true;
+	}
+	if (Date.now() - revokedAt.getTime() > REFRESH_ROTATION_REPLAY_GRACE_MS) {
+		return true;
+	}
+	if (!refreshToken.clientId) {
+		return true;
+	}
+
+	const refreshTokens = await ctx.context.adapter.findMany<
+		OAuthRefreshToken<Scope[]> & { id: string }
+	>({
+		model: "oauthRefreshToken",
+		where: [
+			{ field: "clientId", value: refreshToken.clientId },
+			{ field: "userId", value: refreshToken.userId },
+		],
+	});
+
+	const hasFreshChild = refreshTokens.some((candidate) => {
+		if (candidate.id === refreshToken.id || candidate.revoked) {
+			return false;
+		}
+		const createdAt = normalizeTimestampValue(candidate.createdAt);
+		return createdAt ? createdAt.getTime() >= revokedAt.getTime() : false;
+	});
+
+	return !hasFreshChild;
 }
 
 async function createRefreshToken(
@@ -1066,7 +1120,9 @@ async function handleRefreshTokenGrant(
 	}
 	// Replay revoke (RFC 9700 §4.14: tear down the family)
 	if (refreshToken.revoked) {
-		await invalidateRefreshFamily(ctx, client_id, refreshToken.userId);
+		if (await shouldInvalidateRefreshFamilyForRevokedToken(ctx, refreshToken)) {
+			await invalidateRefreshFamily(ctx, client_id, refreshToken.userId);
+		}
 		throw new APIError("BAD_REQUEST", {
 			error_description: "invalid refresh token",
 			error: "invalid_grant",

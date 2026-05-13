@@ -1134,6 +1134,64 @@ describe("oauth token - refresh_token", async () => {
 	});
 
 	/**
+	 * A stale parent replay immediately after rotation should still fail, but it
+	 * must not delete the newly rotated child or its linked opaque access token.
+	 *
+	 * @see https://github.com/better-auth/better-auth/security/advisories/GHSA-392p-2q2v-4372
+	 */
+	it("keeps the rotated child usable after stale parent replay", async () => {
+		if (!oauthClient?.client_id || !oauthClient?.client_secret) {
+			throw Error("beforeAll not run properly");
+		}
+
+		const scopes = ["openid", "profile", "offline_access"];
+		const tokens = await authorizeForRefreshToken(scopes);
+		expect(tokens?.refresh_token).toBeDefined();
+
+		async function refresh(refreshToken: string) {
+			const { body, headers } = createRefreshAccessTokenRequest({
+				refreshToken,
+				options: {
+					clientId: oauthClient!.client_id,
+					clientSecret: oauthClient!.client_secret!,
+					redirectURI: redirectUri,
+				},
+			});
+			return client.$fetch<{
+				access_token?: string;
+				refresh_token?: string;
+				error?: string;
+			}>("/oauth2/token", {
+				method: "POST",
+				body,
+				headers,
+			});
+		}
+
+		const rotated = await refresh(tokens!.refresh_token!);
+		expect(rotated.error).toBeNull();
+		expect(rotated.data?.refresh_token).toBeDefined();
+
+		const staleReplay = await refresh(tokens!.refresh_token!);
+		expect(
+			(staleReplay.error as { error?: string } | null | undefined)?.error,
+		).toBe("invalid_grant");
+
+		const context = await authorizationServer.$context;
+		const accessRows = await context.adapter.findMany<{
+			refreshId?: string | null;
+		}>({
+			model: "oauthAccessToken",
+			where: [{ field: "clientId", value: oauthClient.client_id }],
+		});
+		expect(accessRows.some((row) => row.refreshId)).toBe(true);
+
+		const next = await refresh(rotated.data!.refresh_token!);
+		expect(next.error).toBeNull();
+		expect(next.data?.refresh_token).toBeDefined();
+	});
+
+	/**
 	 * /oauth2/revoke (RFC 7009) on an active refresh token must mark the row
 	 * `revoked` (via the same CAS used in rotation) so that subsequent reuse
 	 * trips the family-invalidation guard.

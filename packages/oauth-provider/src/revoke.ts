@@ -3,7 +3,11 @@ import { logger } from "@better-auth/core/env";
 import { verifyJwsAccessToken } from "better-auth/oauth2";
 import { APIError } from "better-call";
 import type { JSONWebKeySet } from "jose";
-import { decodeRefreshToken, invalidateRefreshFamily } from "./token";
+import {
+	decodeRefreshToken,
+	invalidateRefreshFamily,
+	shouldInvalidateRefreshFamilyForRevokedToken,
+} from "./token";
 import type {
 	OAuthOpaqueAccessToken,
 	OAuthOptions,
@@ -159,7 +163,9 @@ async function revokeRefreshToken(
 		});
 	}
 	if (refreshToken.revoked) {
-		await invalidateRefreshFamily(ctx, clientId, refreshToken.userId);
+		if (await shouldInvalidateRefreshFamilyForRevokedToken(ctx, refreshToken)) {
+			await invalidateRefreshFamily(ctx, clientId, refreshToken.userId);
+		}
 		throw new APIError("BAD_REQUEST", {
 			error_description: "refresh token revoked",
 			error: "invalid_request",
@@ -191,7 +197,9 @@ async function revokeRefreshToken(
 		},
 	});
 	if (!won) {
-		await invalidateRefreshFamily(ctx, clientId, refreshToken.userId);
+		if (await shouldInvalidateRefreshFamilyForRevokedToken(ctx, refreshToken)) {
+			await invalidateRefreshFamily(ctx, clientId, refreshToken.userId);
+		}
 		throw new APIError("BAD_REQUEST", {
 			error_description: "refresh token revoked",
 			error: "invalid_request",
