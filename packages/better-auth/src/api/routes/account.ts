@@ -3,6 +3,7 @@ import type { Account } from "@better-auth/core/db";
 import { APIError, BASE_ERROR_CODES } from "@better-auth/core/error";
 import type { OAuth2Tokens } from "@better-auth/core/oauth2";
 import { SocialProviderListEnum } from "@better-auth/core/social-providers";
+import { createHash } from "@better-auth/utils/hash";
 
 import * as z from "zod";
 import { getAwaitableValue } from "../../context/helpers";
@@ -19,6 +20,81 @@ import {
 	getSessionFromCtx,
 	sessionMiddleware,
 } from "./session";
+
+const ACCESS_TOKEN_REFRESH_SINGLE_FLIGHT_TTL_MS = 5_000;
+
+type AccessTokenRefreshEntry = {
+	expiresAt: number;
+	promise: Promise<OAuth2Tokens>;
+};
+
+const accessTokenRefreshes = new Map<string, AccessTokenRefreshEntry>();
+
+function cleanExpiredAccessTokenRefreshes(now: number) {
+	for (const [key, entry] of accessTokenRefreshes) {
+		if (entry.expiresAt <= now) {
+			accessTokenRefreshes.delete(key);
+		}
+	}
+}
+
+async function getAccessTokenRefreshKey(input: {
+	accountId?: string | null;
+	providerId: string;
+	refreshToken: string;
+	userId: string;
+}) {
+	const refreshTokenHash = await createHash("SHA-256", "base64urlnopad").digest(
+		new TextEncoder().encode(input.refreshToken),
+	);
+	return [
+		input.providerId,
+		input.userId,
+		input.accountId ?? "",
+		refreshTokenHash,
+	].join(":");
+}
+
+async function refreshAccessTokenOnce(input: {
+	accountId?: string | null;
+	providerId: string;
+	refreshAccessToken: (refreshToken: string) => Promise<OAuth2Tokens>;
+	refreshToken: string;
+	userId: string;
+}) {
+	const now = Date.now();
+	cleanExpiredAccessTokenRefreshes(now);
+
+	const key = await getAccessTokenRefreshKey(input);
+	const existing = accessTokenRefreshes.get(key);
+	if (existing) {
+		return existing.promise;
+	}
+
+	const promise = input.refreshAccessToken(input.refreshToken);
+	accessTokenRefreshes.set(key, {
+		expiresAt: Number.POSITIVE_INFINITY,
+		promise,
+	});
+
+	promise.then(
+		() => {
+			const entry = accessTokenRefreshes.get(key);
+			if (entry?.promise === promise) {
+				entry.expiresAt =
+					Date.now() + ACCESS_TOKEN_REFRESH_SINGLE_FLIGHT_TTL_MS;
+			}
+		},
+		() => {
+			const entry = accessTokenRefreshes.get(key);
+			if (entry?.promise === promise) {
+				accessTokenRefreshes.delete(key);
+			}
+		},
+	);
+
+	return promise;
+}
 
 export const listUserAccounts = createAuthEndpoint(
 	"/list-accounts",
@@ -559,7 +635,13 @@ export const getAccessToken = createAuthEndpoint(
 					account.refreshToken,
 					ctx.context,
 				);
-				newTokens = await provider.refreshAccessToken(refreshToken);
+				newTokens = await refreshAccessTokenOnce({
+					accountId: account.accountId,
+					providerId,
+					refreshAccessToken: provider.refreshAccessToken,
+					refreshToken,
+					userId: resolvedUserId,
+				});
 				const updatedData = {
 					accessToken: await setTokenUtil(newTokens?.accessToken, ctx.context),
 					accessTokenExpiresAt: newTokens?.accessTokenExpiresAt,
@@ -755,9 +837,13 @@ export const refreshToken = createAuthEndpoint(
 				refreshToken,
 				ctx.context,
 			);
-			const tokens: OAuth2Tokens = await provider.refreshAccessToken(
-				decryptedRefreshToken,
-			);
+			const tokens: OAuth2Tokens = await refreshAccessTokenOnce({
+				accountId: account.accountId,
+				providerId,
+				refreshAccessToken: provider.refreshAccessToken,
+				refreshToken: decryptedRefreshToken,
+				userId: resolvedUserId,
+			});
 
 			const resolvedRefreshToken = tokens.refreshToken
 				? await setTokenUtil(tokens.refreshToken, ctx.context)

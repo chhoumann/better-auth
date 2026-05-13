@@ -4,6 +4,7 @@ import {
 	multiSessionClient,
 	organizationClient,
 } from "better-auth/client/plugins";
+import { symmetricDecodeJWT } from "better-auth/crypto";
 import { toNodeHandler } from "better-auth/node";
 import type { GenericOAuthConfig } from "better-auth/plugins/generic-oauth";
 import { genericOAuth } from "better-auth/plugins/generic-oauth";
@@ -978,6 +979,410 @@ describe("oauth", async () => {
 			},
 		});
 		expect(callbackURL).toContain("/success");
+	});
+});
+
+describe("oauth - stateless account refresh rotation trace", async () => {
+	const port = 3051;
+	const authServerBaseUrl = `http://localhost:${port}`;
+	const rpBaseUrl = "http://localhost:5051";
+	const providerId = "test-refresh-race";
+	const redirectUri = `${rpBaseUrl}/api/auth/oauth2/callback/${providerId}`;
+	const scopes = ["openid", "profile", "email", "offline_access"];
+	const trace: RefreshTraceStep[] = [];
+	let tokenEndpointRequests = 0;
+	let server: Listener;
+	let oauthClient: OAuthClient | null = null;
+	let authorizationHeaders: Headers;
+
+	type RefreshTraceStep = {
+		accessTokens?: {
+			id: string;
+			refreshId: string | null;
+		}[];
+		accountCookie?: AccountCookieSnapshot | null;
+		outcomes?: {
+			accessToken: string | null;
+			errorCode: string | null;
+		}[];
+		phase: string;
+		refreshTokens?: {
+			createdAt: string | null;
+			id: string;
+			revoked: boolean;
+		}[];
+		tokenEndpointRequests: number;
+	};
+
+	type AccountCookieSnapshot = {
+		accessToken: string | null;
+		accessTokenExpiresAt: string | null;
+		accountId: string | null;
+		providerId: string | null;
+		refreshToken: string | null;
+		userId: string | null;
+	};
+
+	type AccountCookiePayload = {
+		accessToken?: string | null;
+		accessTokenExpiresAt?: Date | string | null;
+		accountId?: string | null;
+		providerId?: string | null;
+		refreshToken?: string | null;
+		userId?: string | null;
+	};
+
+	type OAuthRefreshTokenRow = {
+		createdAt?: Date | string | null;
+		id: string;
+		revoked?: Date | string | null;
+	};
+
+	type OAuthAccessTokenRow = {
+		id: string;
+		refreshId?: string | null;
+	};
+
+	const {
+		auth: authorizationServer,
+		signInWithTestUser,
+		customFetchImpl,
+	} = await getTestInstance({
+		baseURL: authServerBaseUrl,
+		plugins: [
+			jwt(),
+			oauthProvider({
+				accessTokenExpiresIn: 1,
+				loginPage: "/login",
+				consentPage: "/consent",
+				scopes,
+				silenceWarnings: {
+					oauthAuthServerConfig: true,
+					openidConfig: true,
+				},
+			}),
+		],
+	});
+
+	const serverClient = createAuthClient({
+		plugins: [oauthProviderClient()],
+		baseURL: authServerBaseUrl,
+		fetchOptions: {
+			customFetchImpl,
+		},
+	});
+
+	beforeAll(async () => {
+		server = await listen(
+			async (req, res) => {
+				if (req.url?.startsWith("/api/auth/oauth2/token")) {
+					tokenEndpointRequests++;
+				}
+				if (req.url === "/.well-known/openid-configuration") {
+					const config = await authorizationServer.api.getOpenIdConfig();
+					res.setHeader("Content-Type", "application/json");
+					res.end(JSON.stringify(config));
+				} else {
+					await toNodeHandler(authorizationServer.handler)(req, res);
+				}
+			},
+			{
+				port,
+			},
+		);
+
+		const { headers } = await signInWithTestUser();
+		authorizationHeaders = headers;
+		const response = await authorizationServer.api.adminCreateOAuthClient({
+			headers,
+			body: {
+				redirect_uris: [redirectUri],
+				skip_consent: true,
+			},
+		});
+		expect(response?.client_id).toBeDefined();
+		expect(response?.client_secret).toBeDefined();
+		oauthClient = response;
+	});
+
+	afterAll(async () => {
+		await server.close();
+	});
+
+	async function fingerprint(value?: string | null) {
+		if (!value) {
+			return null;
+		}
+		const digest = await crypto.subtle.digest(
+			"SHA-256",
+			new TextEncoder().encode(value),
+		);
+		return Array.from(new Uint8Array(digest).slice(0, 8))
+			.map((byte) => byte.toString(16).padStart(2, "0"))
+			.join("");
+	}
+
+	function getCookie(headers: Headers, name: string) {
+		for (const cookie of (headers.get("cookie") || "").split(";")) {
+			const [cookieName, ...value] = cookie.trim().split("=");
+			if (cookieName === name && value.length > 0) {
+				return value.join("=");
+			}
+		}
+		return null;
+	}
+
+	function dateLabel(value?: Date | string | null) {
+		if (!value) {
+			return null;
+		}
+		return new Date(value).toISOString();
+	}
+
+	async function decodeAccountCookie(
+		accountDataCookieName: string,
+		headers: Headers,
+		secret: string,
+	) {
+		const accountCookie = getCookie(headers, accountDataCookieName);
+		if (!accountCookie) {
+			return null;
+		}
+		const decoded = await symmetricDecodeJWT<AccountCookiePayload>(
+			accountCookie,
+			secret,
+			"better-auth-account",
+		);
+		if (!decoded) {
+			return null;
+		}
+		return {
+			accessToken: await fingerprint(decoded.accessToken),
+			accessTokenExpiresAt: dateLabel(decoded.accessTokenExpiresAt),
+			accountId: decoded.accountId ?? null,
+			providerId: decoded.providerId ?? null,
+			refreshToken: await fingerprint(decoded.refreshToken),
+			userId: decoded.userId ?? null,
+		} satisfies AccountCookieSnapshot;
+	}
+
+	async function captureTrace(
+		phase: string,
+		accountDataCookieName: string,
+		headers: Headers,
+		rpSecret: string,
+		outcomes?: RefreshTraceStep["outcomes"],
+	) {
+		if (!oauthClient?.client_id) {
+			throw new Error("beforeAll not run properly");
+		}
+		const context = await authorizationServer.$context;
+		const refreshRows = await context.adapter.findMany<OAuthRefreshTokenRow>({
+			model: "oauthRefreshToken",
+			where: [{ field: "clientId", value: oauthClient.client_id }],
+		});
+		const accessRows = await context.adapter.findMany<OAuthAccessTokenRow>({
+			model: "oauthAccessToken",
+			where: [{ field: "clientId", value: oauthClient.client_id }],
+		});
+		trace.push({
+			phase,
+			tokenEndpointRequests,
+			accountCookie: await decodeAccountCookie(
+				accountDataCookieName,
+				headers,
+				rpSecret,
+			),
+			refreshTokens: refreshRows
+				.map((row) => ({
+					id: row.id,
+					revoked: !!row.revoked,
+					createdAt: dateLabel(row.createdAt),
+				}))
+				.sort((a, b) => a.id.localeCompare(b.id)),
+			accessTokens: accessRows
+				.map((row) => ({
+					id: row.id,
+					refreshId: row.refreshId ?? null,
+				}))
+				.sort((a, b) => a.id.localeCompare(b.id)),
+			outcomes,
+		});
+	}
+
+	/**
+	 * Reproduces the browser-side race with a real Better Auth OAuth provider and
+	 * a real Better Auth generic-OAuth relying party using the stateless account
+	 * cookie path. Both RP requests start from the same expired account cookie.
+	 */
+	it("single-flights duplicate expired account-cookie refreshes against the provider", async () => {
+		if (!oauthClient?.client_id || !oauthClient?.client_secret) {
+			throw Error("beforeAll not run properly");
+		}
+		trace.length = 0;
+		tokenEndpointRequests = 0;
+
+		const {
+			auth: relyingParty,
+			customFetchImpl: relyingPartyFetch,
+			cookieSetter: relyingPartyCookieSetter,
+		} = await getTestInstance(
+			{
+				baseURL: rpBaseUrl,
+				account: {
+					storeAccountCookie: true,
+					accountLinking: {
+						trustedProviders: [providerId],
+					},
+				},
+				plugins: [
+					genericOAuth({
+						config: [
+							{
+								providerId,
+								redirectURI: redirectUri,
+								authorizationUrl: `${authServerBaseUrl}/api/auth/oauth2/authorize`,
+								tokenUrl: `${authServerBaseUrl}/api/auth/oauth2/token`,
+								userInfoUrl: `${authServerBaseUrl}/api/auth/oauth2/userinfo`,
+								clientId: oauthClient.client_id,
+								clientSecret: oauthClient.client_secret,
+								scopes,
+								pkce: true,
+							},
+						],
+					}),
+				],
+			},
+			{
+				disableTestUser: true,
+			},
+		);
+		const relyingPartyContext = await relyingParty.$context;
+		const accountDataCookieName =
+			relyingPartyContext.authCookies.accountData.name;
+		const relyingPartyClient = createAuthClient({
+			plugins: [genericOAuthClient()],
+			baseURL: rpBaseUrl,
+			fetchOptions: {
+				customFetchImpl: relyingPartyFetch,
+			},
+		});
+		const relyingPartyHeaders = new Headers();
+
+		const signIn = await relyingPartyClient.signIn.oauth2(
+			{
+				providerId,
+				callbackURL: "/success",
+			},
+			{
+				throw: true,
+				onSuccess: relyingPartyCookieSetter(relyingPartyHeaders),
+			},
+		);
+		expect(signIn.url).toContain(
+			`${authServerBaseUrl}/api/auth/oauth2/authorize`,
+		);
+
+		let callbackRedirectUrl = "";
+		await serverClient.$fetch(signIn.url, {
+			method: "GET",
+			headers: authorizationHeaders,
+			onError(context) {
+				callbackRedirectUrl = context.response.headers.get("Location") || "";
+			},
+		});
+		expect(callbackRedirectUrl).toContain(redirectUri);
+		expect(callbackRedirectUrl).toContain("code=");
+
+		await relyingPartyClient.$fetch(callbackRedirectUrl, {
+			method: "GET",
+			headers: relyingPartyHeaders,
+			onError(context) {
+				relyingPartyCookieSetter(relyingPartyHeaders)(context);
+			},
+		});
+
+		await captureTrace(
+			"after-callback",
+			accountDataCookieName,
+			relyingPartyHeaders,
+			relyingPartyContext.secret,
+		);
+
+		const accountCookie = trace.at(-1)?.accountCookie;
+		expect(accountCookie?.providerId).toBe(providerId);
+		expect(accountCookie?.refreshToken).toBeTruthy();
+		expect(accountCookie?.accessTokenExpiresAt).toBeTruthy();
+
+		await new Promise((resolve) => setTimeout(resolve, 1100));
+		await captureTrace(
+			"after-expiry",
+			accountDataCookieName,
+			relyingPartyHeaders,
+			relyingPartyContext.secret,
+		);
+		expect(
+			new Date(
+				trace.at(-1)?.accountCookie?.accessTokenExpiresAt || 0,
+			).getTime(),
+		).toBeLessThanOrEqual(Date.now());
+
+		const tokenEndpointRequestsBeforeRefresh = tokenEndpointRequests;
+		const firstRequestHeaders = new Headers(relyingPartyHeaders);
+		const secondRequestHeaders = new Headers(relyingPartyHeaders);
+
+		const [first, second] = await Promise.all([
+			relyingPartyClient.getAccessToken(
+				{ providerId },
+				{
+					headers: firstRequestHeaders,
+					onSuccess: relyingPartyCookieSetter(relyingPartyHeaders),
+				},
+			),
+			relyingPartyClient.getAccessToken(
+				{ providerId },
+				{
+					headers: secondRequestHeaders,
+					onSuccess: relyingPartyCookieSetter(relyingPartyHeaders),
+				},
+			),
+		]);
+		const outcomes = await Promise.all(
+			[first, second].map(async (result) => ({
+				accessToken: await fingerprint(result.data?.accessToken),
+				errorCode: result.error?.code ?? null,
+			})),
+		);
+
+		await captureTrace(
+			"after-duplicate-refresh",
+			accountDataCookieName,
+			relyingPartyHeaders,
+			relyingPartyContext.secret,
+			outcomes,
+		);
+
+		const traceMessage = JSON.stringify(trace, null, 2);
+		if (process.env.BETTER_AUTH_REFRESH_TRACE) {
+			console.log(traceMessage);
+		}
+		expect(first.error, traceMessage).toBeNull();
+		expect(second.error, traceMessage).toBeNull();
+		expect(
+			tokenEndpointRequests - tokenEndpointRequestsBeforeRefresh,
+			traceMessage,
+		).toBe(1);
+		expect(
+			trace.at(-1)?.accessTokens?.some((accessToken) => accessToken.refreshId),
+			traceMessage,
+		).toBe(true);
+		expect(
+			trace.at(-1)?.refreshTokens?.filter((row) => !row.revoked).length,
+			traceMessage,
+		).toBe(1);
+		expect(trace.at(-1)?.accountCookie?.refreshToken, traceMessage).not.toBe(
+			accountCookie?.refreshToken,
+		);
 	});
 });
 

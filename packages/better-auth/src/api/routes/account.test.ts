@@ -995,6 +995,141 @@ describe("account", async () => {
 		expect(refreshTokenCalls).toBeGreaterThan(0);
 	});
 
+	it("should single-flight concurrent stateless account cookie access token refreshes", async () => {
+		const { client, cookieSetter } = await getTestInstance({
+			database: undefined,
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+				},
+			},
+			account: {
+				storeAccountCookie: true,
+			},
+		});
+
+		const headers = new Headers();
+		email = "single-flight-cookie@test.com";
+
+		const now = Math.floor(Date.now() / 1000);
+		const initialIdToken = await signJWT(
+			{
+				email,
+				email_verified: true,
+				name: "First Last",
+				picture: "https://lh3.googleusercontent.com/a-/AOh14GjQ4Z7Vw",
+				exp: now + 3600,
+				sub: "single-flight-cookie",
+				iat: now,
+				aud: "test",
+				azp: "test",
+				nbf: now,
+				iss: "test",
+				locale: "en",
+				jti: "single-flight-cookie-initial",
+				given_name: "First",
+				family_name: "Last",
+			} satisfies GoogleProfile,
+			DEFAULT_SECRET,
+		);
+
+		const consumedRefreshTokens = new Set<string>();
+		let refreshTokenCalls = 0;
+		server.use(
+			http.post("https://oauth2.googleapis.com/token", async ({ request }) => {
+				const body = await request.text();
+				const params = new URLSearchParams(body);
+				const grantType = params.get("grant_type");
+
+				if (grantType === "refresh_token") {
+					refreshTokenCalls += 1;
+					const refreshToken = params.get("refresh_token") ?? "";
+					if (consumedRefreshTokens.has(refreshToken)) {
+						return HttpResponse.json(
+							{
+								error: "invalid_grant",
+								error_description: "refresh token reuse",
+							},
+							{ status: 400 },
+						);
+					}
+					consumedRefreshTokens.add(refreshToken);
+					await new Promise((resolve) => setTimeout(resolve, 25));
+					return HttpResponse.json({
+						access_token: "single-flight-access-token",
+						refresh_token: "single-flight-refresh-token",
+						expires_in: 3600,
+					});
+				}
+
+				return HttpResponse.json({
+					access_token: "initial-single-flight-access-token",
+					refresh_token: "initial-single-flight-refresh-token",
+					expires_in: 1,
+					id_token: initialIdToken,
+				});
+			}),
+		);
+
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state =
+			signInRes.data && "url" in signInRes.data && signInRes.data.url
+				? new URL(signInRes.data.url).searchParams.get("state") || ""
+				: "";
+
+		await client.$fetch("/callback/google", {
+			query: { state, code: "test" },
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				cookieSetter(headers)({ response: context.response });
+			},
+		});
+
+		const firstRequestHeaders = new Headers(headers);
+		const secondRequestHeaders = new Headers(headers);
+		const [firstAccessToken, secondAccessToken] = await Promise.all([
+			client.getAccessToken(
+				{ providerId: "google" },
+				{ headers: firstRequestHeaders, onSuccess: cookieSetter(headers) },
+			),
+			client.getAccessToken(
+				{ providerId: "google" },
+				{ headers: secondRequestHeaders, onSuccess: cookieSetter(headers) },
+			),
+		]);
+
+		expect(firstAccessToken.error).toBeFalsy();
+		expect(secondAccessToken.error).toBeFalsy();
+		expect(firstAccessToken.data?.accessToken).toBe(
+			"single-flight-access-token",
+		);
+		expect(secondAccessToken.data?.accessToken).toBe(
+			"single-flight-access-token",
+		);
+		expect(refreshTokenCalls).toBe(1);
+
+		const nextAccessToken = await client.getAccessToken(
+			{ providerId: "google" },
+			{ headers },
+		);
+		expect(nextAccessToken.error).toBeFalsy();
+		expect(nextAccessToken.data?.accessToken).toBe(
+			"single-flight-access-token",
+		);
+		expect(refreshTokenCalls).toBe(1);
+	});
+
 	it("should NOT chunk account data cookies when exceeding 4KB", async () => {
 		const { client, cookieSetter } = await getTestInstance({
 			secret: "better-auth.secret",
